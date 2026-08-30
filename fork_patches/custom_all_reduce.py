@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.2.2
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM main 187b932, skinny-main-hybrid 3-way rebase 2026-08-30
 # (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
 # Changes: adds env-gated all-reduce residency instrumentation
 # (VLLM_SM70_AR_EVT, default off) -- CUDA event pairs baked into captured
 # graphs plus a harvester thread. Measurement tool, dormant in production.
 
+import os
 from contextlib import contextmanager
 from typing import cast
 
+import regex as re
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -32,6 +34,60 @@ except Exception:
     custom_ar = False
 
 logger = init_logger(__name__)
+
+_SM70_TP8_HIERARCHICAL_ELEMENTS = 4096
+_EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
+    r"((?:^|,)\s*expandable_segments\s*:\s*)True(?=\s*(?:,|$))"
+)
+
+
+def _get_effective_allocator_conf() -> str:
+    """Return the allocator config selected by PyTorch on CUDA.
+
+    PyTorch 2.10 prefers the legacy CUDA-specific variable whenever it is
+    present, even when its value is empty, and otherwise falls back to the
+    unified accelerator variable.
+    """
+    if "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
+        return os.environ["PYTORCH_CUDA_ALLOC_CONF"]
+    return os.environ.get("PYTORCH_ALLOC_CONF", "")
+
+
+@contextmanager
+def _disable_expandable_segments_for_cuda_ipc(active: bool):
+    """Keep CUDA-IPC graph buffers on cudaMalloc-backed allocations.
+
+    ``cudaIpcGetMemHandle`` cannot export CUDA VMM allocations created when
+    ``expandable_segments:True`` is active through either supported allocator
+    environment variable. Custom all-reduce exports graph buffers through that
+    legacy IPC API, so disable expandable segments for the complete capture
+    and registration window while preserving every other allocator option.
+    """
+    allocator_conf = _get_effective_allocator_conf()
+    disabled_conf, replacements = _EXPANDABLE_SEGMENTS_TRUE_PATTERN.subn(
+        r"\1False", allocator_conf
+    )
+    should_disable = active and current_platform.is_cuda() and replacements > 0
+    if should_disable:
+        logger.info_once(
+            "Temporarily disabling expandable_segments during custom allreduce "
+            "CUDA graph capture for CUDA IPC compatibility."
+        )
+        torch.cuda.memory._set_allocator_settings(disabled_conf)
+    try:
+        yield
+    finally:
+        if should_disable:
+            torch.cuda.memory._set_allocator_settings(allocator_conf)
+
+
+def _sm70_tp8_hierarchical_peer_ranks(rank: int) -> tuple[int, ...]:
+    """Return the four-rank clique and its direct cross-clique peer."""
+    if not 0 <= rank < 8:
+        raise ValueError(f"SM70 TP8 hierarchical rank must be in [0, 8), got {rank}")
+    clique_base = 0 if rank < 4 else 4
+    pair_rank = rank + 4 if rank < 4 else rank - 4
+    return (*range(clique_base, clique_base + 4), pair_rank)
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:
@@ -175,6 +231,7 @@ class CustomAllreduce:
         device: int | str | torch.device,
         max_size=8192 * 1024,
         symm_mem_enabled=False,
+        long_prefill_fusion_enabled=False,
     ) -> None:
         """
         Args:
@@ -188,6 +245,8 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self.long_prefill_output_ptrs: list[int] | None = None
+        self.sm70_tp4_push_buffer_ptrs: list[int] | None = None
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -240,6 +299,7 @@ class CustomAllreduce:
         if (
             current_platform.is_cuda()
             and symm_mem_enabled
+            and not long_prefill_fusion_enabled
             and device_capability is not None
         ):
             device_capability_str = device_capability.as_version_str()
@@ -267,18 +327,60 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
+        tp8_hierarchical = False
+        hierarchical_peer_ranks: tuple[int, ...] | None = None
         if world_size > 2 and not fully_connected:
-            logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
+            sm70_tp8_candidate = (
+                envs.VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR
+                and world_size == 8
+                and device_capability is not None
+                and device_capability.major == 7
+                and device_capability.minor == 0
             )
-            return
+            if not sm70_tp8_candidate:
+                logger.warning(
+                    "Custom allreduce is disabled because it's not supported on"
+                    " more than two PCIe-only GPUs. To silence this warning, "
+                    "specify disable_custom_all_reduce=True explicitly."
+                )
+                return
+
+            hierarchical_peer_ranks = _sm70_tp8_hierarchical_peer_ranks(rank)
+            try:
+                rank_device_indices = [
+                    device_ids.index(physical_id) for physical_id in physical_device_ids
+                ]
+            except ValueError:
+                logger.warning(
+                    "SM70 TP8 hierarchical custom allreduce cannot map all rank "
+                    "devices into CUDA_VISIBLE_DEVICES."
+                )
+                return
+            local_topology_ok = all(
+                peer == rank
+                or torch.cuda.can_device_access_peer(
+                    device.index, rank_device_indices[peer]
+                )
+                for peer in hierarchical_peer_ranks
+            )
+            topology_status: list[bool | None] = [None] * world_size
+            dist.all_gather_object(topology_status, local_topology_ok, group=self.group)
+            if not all(status is True for status in topology_status):
+                logger.warning(
+                    "SM70 TP8 hierarchical custom allreduce is disabled because "
+                    "a required clique or paired NVLink P2P edge is unavailable."
+                )
+                return
+            tp8_hierarchical = True
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
         # On AMD GPU, p2p is always enabled between XGMI connected GPUs
-        if not current_platform.is_rocm() and not _can_p2p(rank, world_size):
+        if (
+            not tp8_hierarchical
+            and not current_platform.is_rocm()
+            and not _can_p2p(rank, world_size)
+        ):
             logger.warning(
                 "Custom allreduce is disabled because your platform lacks "
                 "GPU P2P capability or P2P test failed. To silence this "
@@ -291,11 +393,22 @@ class CustomAllreduce:
         # Metadata composes of two parts: metadata for synchronization and a
         # temporary buffer for storing intermediate allreduce results.
         self.meta_ptrs = self.create_shared_buffer(
-            ops.meta_size() + max_size, group=group, uncached=True
+            ops.meta_size() + max_size,
+            group=group,
+            uncached=True,
+            peer_ranks=set(hierarchical_peer_ranks)
+            if hierarchical_peer_ranks is not None
+            else None,
         )
         # This is a pre-registered IPC buffer. In eager mode, input tensors
         # are first copied into this buffer before allreduce is performed
-        self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
+        self.buffer_ptrs = self.create_shared_buffer(
+            max_size,
+            group=group,
+            peer_ranks=set(hierarchical_peer_ranks)
+            if hierarchical_peer_ranks is not None
+            else None,
+        )
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
         # 8*world_size bytes where world_size is at most 8. Allocating 8MB
@@ -305,13 +418,48 @@ class CustomAllreduce:
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
         self.max_size = max_size
+        # Provisioning the long-prefill fusion buffers must not widen ordinary
+        # custom-AR dispatch beyond its established 8-MiB policy. The fused
+        # predicate below uses the full allocation capacity explicitly.
+        self.dispatch_max_size = (
+            min(max_size, 8192 * 1024) if long_prefill_fusion_enabled else max_size
+        )
         self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
+        self.tp8_hierarchical = tp8_hierarchical
         self._ptr = ops.init_custom_ar(
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
+        if long_prefill_fusion_enabled:
+            self.long_prefill_output_ptrs = self.create_shared_buffer(
+                max_size,
+                group=group,
+            )
+            ops.register_buffer(self._ptr, self.long_prefill_output_ptrs)
+        if (
+            envs.VLLM_SM70_TP4_PUSH_ALLREDUCE
+            and world_size == 4
+            and fully_connected
+            and current_platform.is_cuda()
+            and device_capability is not None
+            and device_capability.major == 7
+            and device_capability.minor == 0
+        ):
+            push_buffer_size = ops.sm70_tp4_push_allreduce_buffer_size()
+            self.sm70_tp4_push_buffer_ptrs = self.create_shared_buffer(
+                push_buffer_size,
+                group=group,
+            )
+            ops.register_sm70_tp4_push_allreduce_buffer(
+                self._ptr, self.sm70_tp4_push_buffer_ptrs
+            )
+            logger.info(
+                "SM70 TP4 SGLang-style push all-reduce enabled for the "
+                "FP16 80-KiB verifier, 8-KiB decode, and 5-KiB Qwen4Exp "
+                "payloads."
+            )
 
     @contextmanager
     def capture(self):
@@ -320,13 +468,14 @@ class CustomAllreduce:
         `register_graph_buffers` call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
-        try:
-            self._IS_CAPTURING = True
-            yield
-        finally:
-            self._IS_CAPTURING = False
-            if not self.disabled:
-                self.register_graph_buffers()
+        with _disable_expandable_segments_for_cuda_ipc(not self.disabled):
+            try:
+                self._IS_CAPTURING = True
+                yield
+            finally:
+                self._IS_CAPTURING = False
+                if not self.disabled:
+                    self.register_graph_buffers()
 
     def register_graph_buffers(self):
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
@@ -350,16 +499,23 @@ class CustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
+        if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
             return False
         if not is_weak_contiguous(inp):
             return False
+        if self.tp8_hierarchical:
+            return (
+                inp.dtype == torch.float16
+                and inp.numel() == _SM70_TP8_HIERARCHICAL_ELEMENTS
+            )
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         if self.world_size == 2 or self.fully_connected:
-            return inp_size < self.max_size
+            return inp_size < self.dispatch_max_size
         return False
 
     def all_reduce(
@@ -400,9 +556,7 @@ class CustomAllreduce:
         weight: torch.Tensor,
         epsilon: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.can_sm70_tp2_all_reduce_gemma_rms_norm(
-            inp, residual, weight
-        ):
+        if not self.can_sm70_tp2_all_reduce_gemma_rms_norm(inp, residual, weight):
             raise RuntimeError("SM70 TP2 fused all-reduce RMSNorm is unavailable")
         normalized_out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual, dtype=torch.float32)
@@ -492,6 +646,72 @@ class CustomAllreduce:
             and inp.ndim == 2
             and 1 <= inp.shape[0] <= 64
             and inp.shape[1] == 5120
+            and residual.shape == inp.shape
+            and residual.dtype == torch.float32
+            and weight.ndim == 1
+            and weight.numel() == 5120
+            and weight.dtype in (torch.float16, torch.float32)
+            and inp.is_contiguous()
+            and residual.is_contiguous()
+            and weight.is_contiguous()
+            and inp.device == residual.device == weight.device
+        )
+
+    def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        *,
+        normalized_out: torch.Tensor | None = None,
+        residual_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Benchmark-only long-prefill fused RS + Gemma RMSNorm + AG."""
+        if not self.can_sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+            inp, residual, weight
+        ):
+            raise RuntimeError("SM70 TP4 long-prefill fused norm is unavailable")
+        assert self.long_prefill_output_ptrs is not None
+        if normalized_out is None:
+            normalized_out = torch.empty_like(inp)
+        if residual_out is None:
+            residual_out = torch.empty_like(residual, dtype=torch.float32)
+        graph_registered = (
+            self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        )
+        ops.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+            self._ptr,
+            inp,
+            residual,
+            weight,
+            normalized_out,
+            residual_out,
+            0 if graph_registered else self.buffer_ptrs[self.rank],
+            0 if graph_registered else self.long_prefill_output_ptrs[self.rank],
+            self.max_size,
+            epsilon,
+        )
+        return normalized_out, residual_out
+
+    def can_sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        return (
+            not self.disabled
+            and self.long_prefill_output_ptrs is not None
+            and self.world_size == 4
+            and self.fully_connected
+            and inp.is_cuda
+            and inp.dtype == torch.float16
+            and inp.ndim == 2
+            and inp.shape[0] % self.world_size == 0
+            and 1 <= inp.shape[0] // self.world_size <= 2048
+            and inp.shape[1] == 5120
+            and inp.numel() * inp.element_size() <= self.max_size
             and residual.shape == inp.shape
             and residual.dtype == torch.float32
             and weight.ndim == 1
@@ -803,6 +1023,15 @@ class CustomAllreduce:
             self._ptr = 0
             self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
             self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
+            if self.long_prefill_output_ptrs is not None:
+                self.free_shared_buffer(
+                    self.long_prefill_output_ptrs,
+                    rank=self.rank,
+                )
+                self.long_prefill_output_ptrs = None
+            if self.sm70_tp4_push_buffer_ptrs is not None:
+                self.free_shared_buffer(self.sm70_tp4_push_buffer_ptrs, rank=self.rank)
+                self.sm70_tp4_push_buffer_ptrs = None
 
     def __del__(self):
         self.close()
@@ -812,6 +1041,7 @@ class CustomAllreduce:
         size_in_bytes: int,
         group: ProcessGroup | None = None,
         uncached: bool | None = False,
+        peer_ranks: set[int] | None = None,
     ) -> list[int]:
         pointer, handle = ops.allocate_shared_buffer_and_handle(size_in_bytes)
 
@@ -824,7 +1054,10 @@ class CustomAllreduce:
         for i, h in enumerate(handles):
             if i == rank:
                 pointers.append(pointer)  # type: ignore
+            elif peer_ranks is not None and i not in peer_ranks:
+                pointers.append(0)
             else:
+                assert h is not None
                 pointers.append(ops.open_mem_handle(h))
         return pointers
 

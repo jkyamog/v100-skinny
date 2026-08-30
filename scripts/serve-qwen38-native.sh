@@ -88,6 +88,13 @@ EOF
 echo "==> lm_head mode: $HEAD_MODE"
 
 K="${K:-7}"; K1=$((K + 1)); K2=$((K1 * 2))
+# K<=0 disables speculative decoding entirely (e.g. Flash-Next bring-up per
+# 1Cat #361, or MTP-off A/B). K>0 uses the native MTP draft lane.
+if [ "$K" -gt 0 ]; then
+  SPECULATIVE_ARGS="--speculative-config {\"method\":\"mtp\",\"num_speculative_tokens\":$K,\"draft_sample_method\":\"greedy\",\"use_local_argmax_reduction\":true}"
+else
+  SPECULATIVE_ARGS=""
+fi
 # Bind to loopback by default. This server has NO authentication: anything that
 # can reach the port can use the model, read any prompt in flight, and drive
 # the box. Exposing it is a deliberate act, so it needs an explicit HOST and an
@@ -216,7 +223,7 @@ setsid $NUMA_PREFIX "$PY" -m vllm.entrypoints.openai.api_server \
   --reasoning-parser qwen3 \
   --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER" \
   --compilation-config "{\"cudagraph_capture_sizes\":[$K1,$K2]}" \
-  --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$K,\"draft_sample_method\":\"greedy\",\"use_local_argmax_reduction\":true}" \
+  $SPECULATIVE_ARGS \
   --host "$HOST" --port "$PORT" > "$LOG" 2>&1 < /dev/null &
 SERVER_PID=$!
 echo "$SERVER_PID" > "$PIDFILE"

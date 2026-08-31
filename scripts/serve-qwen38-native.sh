@@ -88,6 +88,7 @@ EOF
 echo "==> lm_head mode: $HEAD_MODE"
 
 K="${K:-7}"; K1=$((K + 1)); K2=$((K1 * 2))
+EXTRA_ARGS="${EXTRA_ARGS:-}"  # set -u guard (conf may omit it)
 # K<=0 disables speculative decoding entirely (e.g. Flash-Next bring-up per
 # 1Cat #361, or MTP-off A/B). K>0 uses the native MTP draft lane.
 if [ "$K" -gt 0 ]; then

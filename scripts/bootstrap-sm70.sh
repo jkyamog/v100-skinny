@@ -135,11 +135,17 @@ else:
     print("")
 EOF
 )
-[ "$INSTALLED" = "1.3.0" ] || { [ "${ALLOW_WHEEL_MISMATCH:-0}" = 1 ] && \
-    echo "    WARNING: installed 1cat-vllm $INSTALLED, not 1.3.0" >&2; } || die \
-  "installed 1cat-vllm is '${INSTALLED:-<none>}', not 1.3.0
-   This branch targets 1Cat-vLLM 1.3.0. Override with
-   ALLOW_WHEEL_MISMATCH=1 if you intend a different engine."
+# 1cat-main-hybrid: accept the 1.3.0 release wheel AND 1.3.1.dev* wheels built
+# from 1Cat main (this branch's purpose - flash-next on SM70). Others fail
+# closed unless ALLOW_WHEEL_MISMATCH=1.
+if [ "${INSTALLED#1.3}" = "$INSTALLED" ]; then
+  { [ "${ALLOW_WHEEL_MISMATCH:-0}" = 1 ] && \
+    echo "    WARNING: installed 1cat-vllm $INSTALLED, not a 1.3.x engine" >&2; } || die \
+  "installed 1cat-vllm is '${INSTALLED:-<none>}', not 1.3.x
+   This branch targets 1Cat-vLLM 1.3.x (1.3.0 release or 1.3.1.dev main
+   hybrid). Override with ALLOW_WHEEL_MISMATCH=1 if you intend a
+   different engine."
+fi
 echo "    1cat-vllm $INSTALLED (from installed metadata)"
 
 # tilelang must be pinned. The SM70 TileLang compile is fixed only in 0.1.10

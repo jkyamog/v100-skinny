@@ -235,6 +235,7 @@ setsid $NUMA_PREFIX "$PY" -m vllm.entrypoints.openai.api_server \
   --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER" \
   --compilation-config "{\"cudagraph_capture_sizes\":[$K1,$K2]}" \
   $SPECULATIVE_ARGS \
+  $EXTRA_ARGS \
   --host "$HOST" --port "$PORT" > "$LOG" 2>&1 < /dev/null &
 SERVER_PID=$!
 echo "$SERVER_PID" > "$PIDFILE"

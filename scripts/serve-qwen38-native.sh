@@ -282,7 +282,12 @@ if [ "$HEAD_MODE" = nvfp4 ]; then
 else
   # BF16 mode: the witness is the once-only dense-serve line; a repack
   # string alongside it is a silent downgrade.
-  if grep -q "native BF16 head served dense" "$LOG"; then
+  # Boot-gate profile: `skinny` (default) enforces the full 27B QPN measurement
+# gates (lm_head BF16, KV-decline, QPN2/QPN8 routes + census). `minimal` keeps
+# only universal gates (server up, warm completion) - for engines that do not
+# use the skinny QPN routes, e.g. Flash-Next NVFP4 via TurboMind (1Cat #361).
+if [ "${BOOT_GATE_PROFILE:-skinny}" = "skinny" ]; then
+if grep -q "native BF16 head served dense" "$LOG"; then
     if grep -q "packing from the model's own weights\|falling back to requant pack" "$LOG"; then
       gate "lm_head served dense (BF16 mode)" fail "silent lm_head downgrade"
     else
@@ -348,6 +353,7 @@ CENSUS_EXPECTED=$((128 * TP))
 grep -q "route=qpn8" "$LOG" \
   && gate "QPN8 dispatched at run time" ok \
   || gate "QPN8 dispatched at run time" fail "no qpn8 route observed"
+fi  # BOOT_GATE_PROFILE=skinny
 
 if [ "$FAIL" = 0 ]; then
   echo "==> READY on port $PORT (pid $(cat "$PIDFILE")) — all gates passed"

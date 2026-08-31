@@ -207,6 +207,17 @@ VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT=0 \
 VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD=1 \
 VLLM_SM70_QPN8_MT2=1 \
 VLLM_FLASH_V100_DECODE_PARTITION_SIZE="$DECODE_PARTITION" \
+# Pre-launch sweep: a crashed boot can orphan TP workers that squat GPU memory
+# while stuck in an NCCL broadcast (leader died mid-load; workers never notice).
+# Kill any stale engine from a previous boot before starting a new one.
+for OLD_PID in $(pgrep -f "vllm.entrypoints.openai.api_server|multiprocessing.spawn" 2>/dev/null); do
+  [ "$OLD_PID" = "$$" ] && continue
+  OPGID=$(ps -o pgid= "$OLD_PID" 2>/dev/null | tr -d " ") || true
+  if [ -n "$OPGID" ] && [ "$OPGID" != "$$" ]; then
+    kill -9 -- "-$OPGID" 2>/dev/null && echo "    killed stale engine group $OPGID (pid $OLD_PID)" >&2
+  fi
+done
+
 setsid $NUMA_PREFIX "$PY" -m vllm.entrypoints.openai.api_server \
   --model "$CKPT" \
   --served-model-name "$SERVED_MODEL_NAME" \
